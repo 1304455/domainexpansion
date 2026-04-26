@@ -1,5 +1,7 @@
 """
-領域展開 リアルタイム認識システム
+領域展開 リアルタイム認識システム v2
+- 宿儺・漏瑚: 両手接近検出トリガー（手が重なる直前の判定を使用）
+- 五条:       右手1本、1.5秒保持で発動
 使い方: python recognize.py
 """
 
@@ -10,119 +12,143 @@ import joblib
 import json
 import os
 import time
-from collections import deque
+from collections import deque, Counter
 
 MODEL_DIR = "model"
 
 # ───────────────────────────────────────────────
-# 領域展開データ（キャラクター別）
 DOMAIN_DATA = {
     "sukuna": {
         "name": "両面宿儺",
         "domain": "伏魔御厨子",
-        "color": (0, 30, 180),       # 赤
         "text_color": (80, 80, 255),
         "effect": "■■■ 解・捌 ■■■",
     },
     "gojo": {
         "name": "五条悟",
         "domain": "無量空処",
-        "color": (180, 100, 0),      # 青
         "text_color": (255, 180, 50),
         "effect": "∞ 蒼・赫 ∞",
     },
     "jogo": {
         "name": "漏瑚",
         "domain": "蓋棺鉄囲山",
-        "color": (0, 100, 200),      # オレンジ
         "text_color": (50, 200, 255),
         "effect": "▲ 隕■ ▲",
     },
-    "negative": {
-        "name": None,
-        "domain": None,
-        "color": None,
-        "text_color": None,
-        "effect": None,
-    },
 }
 
-# 認識の安定化パラメータ
-SMOOTHING_WINDOW = 10    # 直近N フレームで多数決
-CONFIDENCE_THRESHOLD = 0.75  # この確信度以上で認識確定
-ACTIVATION_HOLD = 1.5    # 秒: 同じジェスチャーを保持したら「発動」
+# 認識パラメータ
+SMOOTHING_WINDOW     = 8      # 多数決フレーム数
+CONFIDENCE_THRESHOLD = 0.75   # 確信度閾値
+ACTIVATION_HOLD      = 1.5    # 五条: 保持秒数
+APPROACH_THRESHOLD   = 0.18   # 両手接近判定: 手首間距離（正規化座標）
+APPROACH_BUFFER_SEC  = 0.6    # 接近前 何秒分のフレームを遡るか
 # ───────────────────────────────────────────────
 
 
-def extract_features(landmarks_list):
-    """collect_data.py と同一の特徴量抽出（必ず同期を保つこと）"""
+def extract_two_hand_features(landmarks_list):
+    """両手用特徴量（123次元）"""
     if len(landmarks_list) < 2:
         return None
-
     features = []
-
     for hand_lm in landmarks_list[:2]:
         pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark])
-        wrist = pts[0]
-        pts = pts - wrist
+        pts -= pts[0]
         scale = np.linalg.norm(pts[9]) + 1e-6
-        pts = pts / scale
-
+        pts /= scale
         connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4),
-            (0, 5), (5, 6), (6, 7), (7, 8),
-            (0, 9), (9, 10), (10, 11), (11, 12),
-            (0, 13), (13, 14), (14, 15), (15, 16),
-            (0, 17), (17, 18), (18, 19), (19, 20),
+            (0,1),(1,2),(2,3),(3,4),
+            (0,5),(5,6),(6,7),(7,8),
+            (0,9),(9,10),(10,11),(11,12),
+            (0,13),(13,14),(14,15),(15,16),
+            (0,17),(17,18),(18,19),(19,20),
         ]
-        angles = []
-        for (a, b) in connections:
+        for a, b in connections:
             v = pts[b] - pts[a]
-            norm = np.linalg.norm(v) + 1e-6
-            angles.extend([v[0] / norm, v[1] / norm, v[2] / norm])
-
-        features.extend(angles)
-
-    wrist0 = np.array([landmarks_list[0].landmark[0].x,
-                       landmarks_list[0].landmark[0].y,
-                       landmarks_list[0].landmark[0].z])
-    wrist1 = np.array([landmarks_list[1].landmark[0].x,
-                       landmarks_list[1].landmark[0].y,
-                       landmarks_list[1].landmark[0].z])
-    rel = wrist1 - wrist0
-    scale_rel = (
-        np.linalg.norm(np.array([landmarks_list[0].landmark[9].x - wrist0[0],
-                                 landmarks_list[0].landmark[9].y - wrist0[1],
-                                 landmarks_list[0].landmark[9].z - wrist0[2]]))
-        + 1e-6
-    )
-    features.extend((rel / scale_rel).tolist())
+            n = np.linalg.norm(v) + 1e-6
+            features.extend([v[0]/n, v[1]/n, v[2]/n])
+    w0 = np.array([landmarks_list[0].landmark[0].x,
+                   landmarks_list[0].landmark[0].y,
+                   landmarks_list[0].landmark[0].z])
+    w1 = np.array([landmarks_list[1].landmark[0].x,
+                   landmarks_list[1].landmark[0].y,
+                   landmarks_list[1].landmark[0].z])
+    rel = w1 - w0
+    sc = np.linalg.norm(np.array([
+        landmarks_list[0].landmark[9].x - w0[0],
+        landmarks_list[0].landmark[9].y - w0[1],
+        landmarks_list[0].landmark[9].z - w0[2],
+    ])) + 1e-6
+    features.extend((rel / sc).tolist())
     return np.array(features)
+
+
+def extract_one_hand_features(hand_lm):
+    """片手（右手）用特徴量（60次元）"""
+    pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm.landmark])
+    pts -= pts[0]
+    scale = np.linalg.norm(pts[9]) + 1e-6
+    pts /= scale
+    connections = [
+        (0,1),(1,2),(2,3),(3,4),
+        (0,5),(5,6),(6,7),(7,8),
+        (0,9),(9,10),(10,11),(11,12),
+        (0,13),(13,14),(14,15),(15,16),
+        (0,17),(17,18),(18,19),(19,20),
+    ]
+    features = []
+    for a, b in connections:
+        v = pts[b] - pts[a]
+        n = np.linalg.norm(v) + 1e-6
+        features.extend([v[0]/n, v[1]/n, v[2]/n])
+    return np.array(features)
+
+
+def get_right_hand(landmarks_list, handedness_list):
+    """右手ランドマークを返す（映像反転考慮: Label=='Left'が実際の右手）"""
+    for lm, hd in zip(landmarks_list, handedness_list):
+        if hd.classification[0].label == "Left":
+            return lm
+    return None
+
+
+def wrist_distance(lm_list):
+    """2手の手首間距離（正規化座標）"""
+    w0 = np.array([lm_list[0].landmark[0].x, lm_list[0].landmark[0].y])
+    w1 = np.array([lm_list[1].landmark[0].x, lm_list[1].landmark[0].y])
+    return np.linalg.norm(w1 - w0)
 
 
 class DomainExpansionApp:
     def __init__(self):
-        # モデル読み込み
-        clf_path = os.path.join(MODEL_DIR, "classifier.pkl")
-        le_path = os.path.join(MODEL_DIR, "label_encoder.pkl")
+        # 両手モデル
+        two_clf  = os.path.join(MODEL_DIR, "two_hand_classifier.pkl")
+        two_le   = os.path.join(MODEL_DIR, "two_hand_label_encoder.pkl")
+        # 片手モデル
+        one_clf  = os.path.join(MODEL_DIR, "one_hand_classifier.pkl")
+        one_le   = os.path.join(MODEL_DIR, "one_hand_label_encoder.pkl")
         meta_path = os.path.join(MODEL_DIR, "meta.json")
 
-        if not os.path.exists(clf_path):
-            raise FileNotFoundError(
-                "モデルが見つかりません。先に train.py を実行してください。"
-            )
+        for p in [two_clf, two_le, one_clf, one_le]:
+            if not os.path.exists(p):
+                raise FileNotFoundError(
+                    f"モデルが見つかりません: {p}\n先に train.py を実行してください。"
+                )
 
-        self.pipeline = joblib.load(clf_path)
-        self.le = joblib.load(le_path)
+        self.two_pipeline = joblib.load(two_clf)
+        self.two_le       = joblib.load(two_le)
+        self.one_pipeline = joblib.load(one_clf)
+        self.one_le       = joblib.load(one_le)
 
         with open(meta_path) as f:
-            self.meta = json.load(f)
+            meta = json.load(f)
+        print("✅ モデル読み込み完了")
+        print(f"   両手: {meta['two_hand']['classes']}  "
+              f"精度 {meta['two_hand']['cv_accuracy_mean']:.1%}")
+        print(f"   片手: {meta['one_hand']['classes']}  "
+              f"精度 {meta['one_hand']['cv_accuracy_mean']:.1%}")
 
-        print(f"✅ モデル読み込み完了")
-        print(f"   クラス: {self.meta['classes']}")
-        print(f"   学習精度: {self.meta['cv_accuracy_mean']:.1%}")
-
-        # MediaPipe
         mp_hands = mp.solutions.hands
         self.hands = mp_hands.Hands(
             static_image_mode=False,
@@ -131,205 +157,218 @@ class DomainExpansionApp:
             min_tracking_confidence=0.5,
         )
         self.mp_hands = mp_hands
-        self.mp_draw = mp.solutions.drawing_utils
+        self.mp_draw  = mp.solutions.drawing_utils
 
-        # 認識状態
-        self.pred_history = deque(maxlen=SMOOTHING_WINDOW)
-        self.conf_history = deque(maxlen=SMOOTHING_WINDOW)
-        self.activation_start = None
-        self.current_gesture = None
-        self.activated_gesture = None
-        self.activation_time = None
-        self.show_activation = False
-        self.activation_display_start = None
+        # ── 認識状態 ──
+        # 五条用スムージング
+        self.one_pred_hist = deque(maxlen=SMOOTHING_WINDOW)
+        self.one_conf_hist = deque(maxlen=SMOOTHING_WINDOW)
+        # 五条: 発動チャージ
+        self.gojo_charge_start = None
 
-    def predict(self, features):
-        """特徴量から予測クラスと確信度を返す"""
-        feats_2d = features.reshape(1, -1)
-        proba = self.pipeline.predict_proba(feats_2d)[0]
-        pred_idx = np.argmax(proba)
-        pred_label = self.le.inverse_transform([pred_idx])[0]
-        confidence = proba[pred_idx]
-        return pred_label, confidence, proba
+        # 両手接近バッファ: (timestamp, label, confidence) を時刻ベースで管理
+        # dequeのmaxlenは大きめに取り、古いエントリは時刻で除外する
+        self.two_pred_buffer = deque(maxlen=120)  # 最大120フレーム分確保
 
-    def smooth_prediction(self, pred, conf):
-        """直近Nフレームの多数決で安定化"""
-        self.pred_history.append(pred)
-        self.conf_history.append(conf)
+        # 接近トリガーのクールダウン（連続誤発動防止）
+        self.last_activation_time = 0.0
+        ACTIVATION_COOLDOWN = 3.0  # 秒: 発動後この時間は再発動しない
+        self._cooldown = ACTIVATION_COOLDOWN
 
-        if len(self.pred_history) < SMOOTHING_WINDOW // 2:
+        # 発動演出
+        self.activated_gesture     = None
+        self.activation_disp_start = None
+
+    # ── 予測ヘルパー ──
+    def predict_two(self, feats):
+        p = self.two_pipeline.predict_proba(feats.reshape(1, -1))[0]
+        idx = np.argmax(p)
+        return self.two_le.inverse_transform([idx])[0], p[idx]
+
+    def predict_one(self, feats):
+        p = self.one_pipeline.predict_proba(feats.reshape(1, -1))[0]
+        idx = np.argmax(p)
+        return self.one_le.inverse_transform([idx])[0], p[idx]
+
+    def smooth_one(self, label, conf):
+        self.one_pred_hist.append(label)
+        self.one_conf_hist.append(conf)
+        if len(self.one_pred_hist) < SMOOTHING_WINDOW // 2:
             return None, 0.0
+        counter = Counter(self.one_pred_hist)
+        best, cnt = counter.most_common(1)[0]
+        ratio = cnt / len(self.one_pred_hist)
+        # 多数決の票率が低い場合はNoneを返す（過剰割り引きせず票率でフィルタ）
+        if ratio < 0.5:
+            return None, 0.0
+        avg_conf = np.mean([c for p, c in zip(self.one_pred_hist, self.one_conf_hist)
+                            if p == best])
+        return best, avg_conf
 
-        # 多数決
-        from collections import Counter
-        counter = Counter(self.pred_history)
-        best_label, best_count = counter.most_common(1)[0]
-        ratio = best_count / len(self.pred_history)
-
-        avg_conf = np.mean([c for p, c in zip(self.pred_history, self.conf_history)
-                            if p == best_label])
-        return best_label, avg_conf * ratio
-
-    def draw_activation_effect(self, frame, gesture_key):
-        """領域展開発動エフェクト"""
+    # ── 発動エフェクト ──
+    def draw_activation(self, frame, key):
         h, w = frame.shape[:2]
-        data = DOMAIN_DATA[gesture_key]
-
-        # 暗転オーバーレイ
-        elapsed = time.time() - self.activation_display_start
-        overlay = frame.copy()
-
-        # フェードイン
+        d = DOMAIN_DATA[key]
+        elapsed = time.time() - self.activation_disp_start
         alpha = min(elapsed * 2, 0.85)
+        overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
         cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
-        # 中央テキスト
-        center_x, center_y = w // 2, h // 2
+        cx, cy = w // 2, h // 2
         font = cv2.FONT_HERSHEY_SIMPLEX
 
-        # 領域名（大）
-        domain_text = data["domain"]
-        text_size = cv2.getTextSize(domain_text, font, 1.5, 3)[0]
-        cv2.putText(frame, domain_text,
-                    (center_x - text_size[0] // 2, center_y),
-                    font, 1.5, data["text_color"], 3)
-
-        # キャラ名（小）
-        char_text = data["name"]
-        char_size = cv2.getTextSize(char_text, font, 0.9, 2)[0]
-        cv2.putText(frame, char_text,
-                    (center_x - char_size[0] // 2, center_y + 50),
-                    font, 0.9, (200, 200, 200), 2)
-
-        # エフェクトテキスト
-        eff_text = data["effect"]
-        eff_size = cv2.getTextSize(eff_text, font, 0.8, 2)[0]
-        cv2.putText(frame, eff_text,
-                    (center_x - eff_size[0] // 2, center_y - 60),
-                    font, 0.8, data["text_color"], 2)
-
-        # 「領域展開」テキスト（上部）
-        header = "領域展開"
-        header_size = cv2.getTextSize(header, font, 1.2, 3)[0]
-        cv2.putText(frame, header,
-                    (center_x - header_size[0] // 2, 80),
-                    font, 1.2, (255, 255, 255), 3)
-
+        for text, y_off, scale, thick in [
+            ("領域展開",          -120, 1.2, 3),
+            (d["effect"],         -60,  0.8, 2),
+            (d["domain"],          0,   1.5, 3),
+            (d["name"],            55,  0.9, 2),
+        ]:
+            sz = cv2.getTextSize(text, font, scale, thick)[0]
+            color = (255,255,255) if text in ("領域展開",) else d["text_color"]
+            if text == d["name"]:
+                color = (200, 200, 200)
+            cv2.putText(frame, text, (cx - sz[0]//2, cy + y_off),
+                        font, scale, color, thick)
         return frame
 
+    # ── メインループ ──
     def run(self):
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("❌ カメラが開けません")
             return
-
-        print("\n[Q] で終了  [R] でリセット\n掌印を結んでください...\n")
+        print("\n[Q] 終了  [R] リセット\n")
 
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
-
                 frame = cv2.flip(frame, 1)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 result = self.hands.process(rgb)
 
-                # 発動エフェクト表示中
-                if self.show_activation:
-                    elapsed = time.time() - self.activation_display_start
-                    if elapsed < 3.0:
-                        frame = self.draw_activation_effect(frame, self.activated_gesture)
+                # 発動演出中
+                if self.activated_gesture:
+                    if time.time() - self.activation_disp_start < 3.0:
+                        frame = self.draw_activation(frame, self.activated_gesture)
                         cv2.imshow("領域展開", frame)
                         key = cv2.waitKey(1) & 0xFF
-                        if key == ord("q"):
-                            break
-                        elif key == ord("r"):
-                            self.show_activation = False
+                        if key == ord("q"): break
+                        if key == ord("r"): self.activated_gesture = None
                         continue
                     else:
-                        self.show_activation = False
                         self.activated_gesture = None
 
                 # ランドマーク描画
-                if result.multi_hand_landmarks:
-                    for hand_lm in result.multi_hand_landmarks:
-                        self.mp_draw.draw_landmarks(
-                            frame, hand_lm, self.mp_hands.HAND_CONNECTIONS,
-                            self.mp_draw.DrawingSpec(color=(0, 255, 100), thickness=2, circle_radius=3),
-                            self.mp_draw.DrawingSpec(color=(200, 100, 0), thickness=2),
-                        )
+                lm_list = result.multi_hand_landmarks or []
+                hd_list = result.multi_handedness or []
+                for lm in lm_list:
+                    self.mp_draw.draw_landmarks(
+                        frame, lm, self.mp_hands.HAND_CONNECTIONS,
+                        self.mp_draw.DrawingSpec(color=(0,255,100), thickness=2, circle_radius=3),
+                        self.mp_draw.DrawingSpec(color=(200,100,0), thickness=2),
+                    )
 
-                # 予測
-                smoothed_label, smoothed_conf = None, 0.0
-                if result.multi_hand_landmarks and len(result.multi_hand_landmarks) == 2:
-                    feats = extract_features(result.multi_hand_landmarks)
-                    if feats is not None:
-                        raw_label, raw_conf, proba = self.predict(feats)
-                        smoothed_label, smoothed_conf = self.smooth_prediction(raw_label, raw_conf)
-
-                # 発動判定
-                if (smoothed_label and smoothed_label != "negative"
-                        and smoothed_conf >= CONFIDENCE_THRESHOLD):
-                    if smoothed_label != self.current_gesture:
-                        self.current_gesture = smoothed_label
-                        self.activation_start = time.time()
-                    elif time.time() - self.activation_start >= ACTIVATION_HOLD:
-                        # 発動！
-                        self.activated_gesture = smoothed_label
-                        self.show_activation = True
-                        self.activation_display_start = time.time()
-                        self.current_gesture = None
-                        self.activation_start = None
-                        self.pred_history.clear()
-                        print(f"🔥 領域展開: {DOMAIN_DATA[smoothed_label]['domain']}")
-                else:
-                    self.current_gesture = None
-                    self.activation_start = None
-
-                # UI描画
                 h, w = frame.shape[:2]
-                cv2.rectangle(frame, (0, 0), (w, 50), (15, 15, 15), -1)
-                cv2.rectangle(frame, (0, h - 80), (w, h), (15, 15, 15), -1)
+                now = time.time()
+                status_lines = []  # 画面下部に表示するデバッグ情報
 
-                # 手の検出状態
-                hand_count = len(result.multi_hand_landmarks) if result.multi_hand_landmarks else 0
-                hc = (0, 200, 80) if hand_count == 2 else (80, 80, 200)
-                cv2.putText(frame, f"手: {hand_count}/2", (10, 32),
+                # ════════════════════════════════
+                # ① 両手検出時: バッファ蓄積 + 接近トリガー
+                # ════════════════════════════════
+                if len(lm_list) == 2:
+                    feats = extract_two_hand_features(lm_list)
+                    if feats is not None:
+                        label, conf = self.predict_two(feats)
+                        self.two_pred_buffer.append((now, label, conf))
+
+                    # 古いバッファエントリを時刻で除去（FPS依存を排除）
+                    while self.two_pred_buffer and now - self.two_pred_buffer[0][0] > APPROACH_BUFFER_SEC:
+                        self.two_pred_buffer.popleft()
+
+                    # 手首間距離を計算
+                    dist = wrist_distance(lm_list)
+                    status_lines.append(f"両手距離: {dist:.3f}")
+
+                    # 接近トリガー: 閾値以下 かつ クールダウン経過済み かつ バッファに有効な予測あり
+                    cooldown_ok = (now - self.last_activation_time) > self._cooldown
+                    if dist < APPROACH_THRESHOLD and len(self.two_pred_buffer) > 3 and cooldown_ok:
+                        # バッファの直近予測を多数決
+                        recent = [(l, c) for _, l, c in self.two_pred_buffer
+                                  if l not in ("negative_two",) and c >= CONFIDENCE_THRESHOLD]
+                        if recent:
+                            counter = Counter(l for l, _ in recent)
+                            best_label, cnt = counter.most_common(1)[0]
+                            avg_conf = np.mean([c for l, c in recent if l == best_label])
+                            if cnt >= 2 and best_label in DOMAIN_DATA:
+                                # 発動
+                                self.activated_gesture     = best_label
+                                self.activation_disp_start = now
+                                self.last_activation_time  = now
+                                self.two_pred_buffer.clear()
+                                print(f"🔥 領域展開（接近トリガー）: {DOMAIN_DATA[best_label]['domain']}")
+
+                # ════════════════════════════════
+                # ② 右手1本検出: 五条判定（両手検出中は走らせない）
+                # ════════════════════════════════
+                right_lm = None
+                if len(lm_list) != 2 and lm_list and hd_list:  # 両手検出中は五条判定をスキップ
+                    right_lm = get_right_hand(lm_list, hd_list)
+                if right_lm is not None:
+                    feats1 = extract_one_hand_features(right_lm)
+                    raw_label, raw_conf = self.predict_one(feats1)
+                    smooth_label, smooth_conf = self.smooth_one(raw_label, raw_conf)
+
+                    if (smooth_label == "gojo"
+                            and smooth_conf >= CONFIDENCE_THRESHOLD):
+                        if self.gojo_charge_start is None:
+                            self.gojo_charge_start = now
+                        charge = now - self.gojo_charge_start
+                        status_lines.append(f"五条チャージ: {charge:.1f}s")
+
+                        if charge >= ACTIVATION_HOLD:
+                            self.activated_gesture     = "gojo"
+                            self.activation_disp_start = now
+                            self.gojo_charge_start     = None
+                            self.one_pred_hist.clear()
+                            print("🔥 領域展開（保持トリガー）: 無量空処")
+                    else:
+                        self.gojo_charge_start = None
+
+                # ════════════════════════════════
+                # UI
+                # ════════════════════════════════
+                cv2.rectangle(frame, (0, 0), (w, 50), (15,15,15), -1)
+                cv2.rectangle(frame, (0, h-30*(len(status_lines)+1)), (w, h), (15,15,15), -1)
+
+                hand_count = len(lm_list)
+                hc = (0,200,80) if hand_count > 0 else (80,80,200)
+                cv2.putText(frame, f"手: {hand_count}本", (10, 32),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.75, hc, 2)
 
-                # 認識結果
-                if smoothed_label and smoothed_label != "negative" and smoothed_conf > 0.5:
-                    data = DOMAIN_DATA[smoothed_label]
-                    label_text = f"{data['name']} ({smoothed_conf:.0%})"
-                    cv2.putText(frame, label_text, (120, 32),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, data["text_color"], 2)
+                # 五条チャージバー
+                if self.gojo_charge_start:
+                    charge = min((now - self.gojo_charge_start) / ACTIVATION_HOLD, 1.0)
+                    bw = int((w - 20) * charge)
+                    col = (0, int(200*charge), int(255*(1-charge)))
+                    cv2.rectangle(frame, (10, h-50), (10+bw, h-38), col, -1)
+                    cv2.rectangle(frame, (10, h-50), (w-10, h-38), (80,80,80), 1)
+                    cv2.putText(frame, f"無量空処 CHARGE",
+                                (10, h-55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,180,50), 2)
 
-                    # チャージバー
-                    if self.activation_start:
-                        charge = min((time.time() - self.activation_start) / ACTIVATION_HOLD, 1.0)
-                        bar_w = int((w - 20) * charge)
-                        color = (0, int(200 * charge), int(255 * (1 - charge)))
-                        cv2.rectangle(frame, (10, h - 70), (10 + bar_w, h - 55), color, -1)
-                        cv2.rectangle(frame, (10, h - 70), (w - 10, h - 55), (80, 80, 80), 1)
-                        cv2.putText(frame, "CHARGE", (10, h - 40),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
-                        domain_text = DOMAIN_DATA[smoothed_label]["domain"]
-                        cv2.putText(frame, domain_text, (10, h - 15),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, data["text_color"], 2)
-                else:
-                    cv2.putText(frame, "掌印を結んでください", (120, 32),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (120, 120, 120), 1)
+                for i, line in enumerate(status_lines):
+                    cv2.putText(frame, line, (10, h - 10 - 22*i),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160,160,160), 1)
 
                 cv2.imshow("領域展開", frame)
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
-                elif key == ord("r"):
-                    self.pred_history.clear()
-                    self.current_gesture = None
-                    self.activation_start = None
+                if key == ord("q"): break
+                if key == ord("r"):
+                    self.two_pred_buffer.clear()
+                    self.one_pred_hist.clear()
+                    self.gojo_charge_start = None
 
         finally:
             cap.release()
@@ -337,14 +376,9 @@ class DomainExpansionApp:
             self.hands.close()
 
 
-def main():
-    print("\n=== 領域展開 認識システム ===\n")
+if __name__ == "__main__":
+    print("\n=== 領域展開 認識システム v2 ===\n")
     try:
-        app = DomainExpansionApp()
-        app.run()
+        DomainExpansionApp().run()
     except FileNotFoundError as e:
         print(f"\n❌ {e}")
-
-
-if __name__ == "__main__":
-    main()

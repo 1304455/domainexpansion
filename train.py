@@ -1,5 +1,6 @@
 """
 領域展開 掌印分類器 トレーニングスクリプト
+両手モデル（宿儺・漏瑚）と片手モデル（五条）を別々に学習する。
 使い方: python train.py
 """
 
@@ -16,64 +17,58 @@ import json
 
 DATA_DIR = "data"
 MODEL_DIR = "model"
-GESTURE_LABELS = ["sukuna", "gojo", "jogo", "negative"]
+
+# モデルごとに使うジェスチャーを定義
+TWO_HAND_GESTURES = ["sukuna", "jogo", "negative_two"]
+ONE_HAND_GESTURES = ["gojo", "negative_one"]
 
 
-def load_dataset():
+def load_data(gestures: list, expected_dim: int = None) -> tuple:
     X, y = [], []
     counts = {}
-
-    for gesture in GESTURE_LABELS:
+    for gesture in gestures:
         path = os.path.join(DATA_DIR, f"{gesture}.csv")
         if not os.path.exists(path):
-            print(f"⚠️  データなし: {path}")
+            print(f"  ⚠️  データなし: {path} (スキップ)")
             continue
-
         with open(path) as f:
-            reader = csv.reader(f)
-            rows = list(reader)
-
+            rows = list(csv.reader(f))
+        skipped = 0
         for row in rows:
             if len(row) < 2:
                 continue
-            label = row[0]
             try:
                 feats = [float(v) for v in row[1:]]
+                # 次元チェック: 期待次元と異なるデータを無言で混入させない
+                if expected_dim is not None and len(feats) != expected_dim:
+                    skipped += 1
+                    continue
                 X.append(feats)
-                y.append(label)
+                y.append(row[0])
             except ValueError:
                 continue
-
-        counts[gesture] = len(rows)
-        print(f"  {gesture}: {len(rows)} サンプル")
-
+        counts[gesture] = len(rows) - skipped
+        msg = f"    {gesture}: {counts[gesture]} サンプル"
+        if skipped > 0:
+            msg += f"  ⚠️ {skipped}件を次元不一致でスキップ"
+        print(msg)
     return np.array(X), np.array(y), counts
 
 
-def train():
-    print("\n=== 掌印分類器 トレーニング ===\n")
-    print("データ読み込み中...")
-    X, y, counts = load_dataset()
-
+def train_model(X, y, model_name: str) -> dict:
+    """学習してモデルを保存。metricsを返す。"""
     if len(X) == 0:
-        print("\n❌ データが見つかりません。先に collect_data.py を実行してください。")
-        return
+        print(f"  ❌ {model_name}: データなし")
+        return {}
 
-    print(f"\n総サンプル数: {len(X)}")
-    print(f"特徴量次元: {X.shape[1]}")
+    unique = np.unique(y)
+    if len(unique) < 2:
+        print(f"  ❌ {model_name}: クラスが1種類しかない ({unique})")
+        return {}
 
-    # クラスが2種類未満はエラー
-    unique_labels = np.unique(y)
-    if len(unique_labels) < 2:
-        print(f"\n❌ 学習には最低2クラスのデータが必要です。現在: {unique_labels}")
-        return
-
-    # ラベルエンコード
     le = LabelEncoder()
     y_enc = le.fit_transform(y)
 
-    # パイプライン: 標準化 + Gradient Boosting
-    # GBはハンドジェスチャーの非線形境界に強い
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", GradientBoostingClassifier(
@@ -85,43 +80,58 @@ def train():
         )),
     ])
 
-    # Stratified K-Fold Cross Validation
-    print("\nクロスバリデーション中 (5-fold)...")
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_scores = cross_val_score(pipeline, X, y_enc, cv=cv, scoring="accuracy")
-    print(f"  CV Accuracy: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
-    print(f"  各fold: {[f'{s:.3f}' for s in cv_scores]}")
+    scores = cross_val_score(pipeline, X, y_enc, cv=cv, scoring="accuracy")
+    print(f"  CV Accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
 
-    # 全データで最終学習
-    print("\n全データで最終学習中...")
     pipeline.fit(X, y_enc)
 
-    # 保存
     os.makedirs(MODEL_DIR, exist_ok=True)
-    joblib.dump(pipeline, os.path.join(MODEL_DIR, "classifier.pkl"))
-    joblib.dump(le, os.path.join(MODEL_DIR, "label_encoder.pkl"))
+    joblib.dump(pipeline, os.path.join(MODEL_DIR, f"{model_name}_classifier.pkl"))
+    joblib.dump(le, os.path.join(MODEL_DIR, f"{model_name}_label_encoder.pkl"))
 
-    # メタデータ保存
-    meta = {
+    return {
         "classes": le.classes_.tolist(),
-        "n_features": X.shape[1],
-        "n_samples": len(X),
-        "cv_accuracy_mean": float(cv_scores.mean()),
-        "cv_accuracy_std": float(cv_scores.std()),
-        "sample_counts": counts,
+        "n_features": int(X.shape[1]),
+        "n_samples": int(len(X)),
+        "cv_accuracy_mean": float(scores.mean()),
+        "cv_accuracy_std": float(scores.std()),
     }
-    with open(os.path.join(MODEL_DIR, "meta.json"), "w") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print(f"\n✅ モデル保存完了: {MODEL_DIR}/")
-    print(f"   クラス: {le.classes_.tolist()}")
-    print(f"   CV精度: {cv_scores.mean():.1%}")
 
-    if cv_scores.mean() < 0.85:
-        print("\n⚠️  精度が低めです。以下を試してください:")
-        print("   - 各クラス 300+ サンプル収集")
-        print("   - 掌印のバリエーション（角度・距離）を増やす")
+def main():
+    print("\n=== 領域展開 掌印分類器 トレーニング ===\n")
+
+    meta = {}
+
+    # ── 両手モデル（特徴量123次元） ──
+    print("【両手モデル】宿儺・漏瑚")
+    X2, y2, counts2 = load_data(TWO_HAND_GESTURES, expected_dim=123)
+    metrics2 = train_model(X2, y2, "two_hand")
+    if metrics2:
+        meta["two_hand"] = {**metrics2, "sample_counts": counts2}
+        if metrics2["cv_accuracy_mean"] < 0.85:
+            print("  ⚠️  精度低め。各クラス300+サンプル推奨")
+
+    print()
+
+    # ── 片手モデル（特徴量60次元） ──
+    print("【片手モデル】五条")
+    X1, y1, counts1 = load_data(ONE_HAND_GESTURES, expected_dim=60)
+    metrics1 = train_model(X1, y1, "one_hand")
+    if metrics1:
+        meta["one_hand"] = {**metrics1, "sample_counts": counts1}
+        if metrics1["cv_accuracy_mean"] < 0.85:
+            print("  ⚠️  精度低め。各クラス300+サンプル推奨")
+
+    # メタ保存
+    if meta:
+        with open(os.path.join(MODEL_DIR, "meta.json"), "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"\n✅ モデル保存完了: {MODEL_DIR}/")
+    else:
+        print("\n❌ 学習できるデータがありませんでした")
 
 
 if __name__ == "__main__":
-    train()
+    main()
