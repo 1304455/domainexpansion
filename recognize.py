@@ -13,8 +13,34 @@ import json
 import os
 import time
 from collections import deque, Counter
+from PIL import Image, ImageDraw, ImageFont
 
 MODEL_DIR = "model"
+
+# Windowsの標準フォントパス（日本語用）
+FONT_PATH = "C:\\Windows\\Fonts\\msgothic.ttc"
+
+def cv2_putText_jp(img, text, position, font_size, color, thickness=2, anchor="ls"):
+    """
+    OpenCV画像に日本語を表示する。
+    PILを使用して描画し、OpenCV形式に戻す。
+    anchor="ls" (left, baseline) は cv2.putText の左下基準に近い。
+    """
+    if not os.path.exists(FONT_PATH):
+        # フォントがない場合は標準の cv2.putText を試みる（文字化けする可能性が高い）
+        cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_size/30, color, thickness)
+        return img
+
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    font = ImageFont.truetype(FONT_PATH, int(font_size))
+    
+    # OpenCV (BGR) -> PIL (RGB)
+    rgb_color = (color[2], color[1], color[0])
+    
+    draw.text(position, text, font=font, fill=rgb_color, anchor=anchor)
+    
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 # ───────────────────────────────────────────────
 DOMAIN_DATA = {
@@ -216,20 +242,32 @@ class DomainExpansionApp:
         cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
         cx, cy = w // 2, h // 2
-        font = cv2.FONT_HERSHEY_SIMPLEX
 
-        for text, y_off, scale, thick in [
-            ("領域展開",          -120, 1.2, 3),
-            (d["effect"],         -60,  0.8, 2),
-            (d["domain"],          0,   1.5, 3),
-            (d["name"],            55,  0.9, 2),
+        for text, y_off, fsize, thick in [
+            ("領域展開",          -120, 48, 3),
+            (d["effect"],         -60,  32, 2),
+            (d["domain"],          0,   60, 3),
+            (d["name"],            55,  36, 2),
         ]:
-            sz = cv2.getTextSize(text, font, scale, thick)[0]
             color = (255,255,255) if text in ("領域展開",) else d["text_color"]
             if text == d["name"]:
                 color = (200, 200, 200)
-            cv2.putText(frame, text, (cx - sz[0]//2, cy + y_off),
-                        font, scale, color, thick)
+
+            # 中央揃えのためにサイズ計算
+            if os.path.exists(FONT_PATH):
+                font = ImageFont.truetype(FONT_PATH, fsize)
+                bbox = font.getbbox(text)
+                tw = bbox[2] - bbox[0]
+                pos = (cx - tw // 2, cy + y_off)
+                frame = cv2_putText_jp(frame, text, pos, fsize, color, thick, anchor="lt")
+            else:
+                # フォントがない場合のフォールバック
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                scale = fsize / 30
+                sz = cv2.getTextSize(text, font, scale, thick)[0]
+                cv2.putText(frame, text, (cx - sz[0]//2, cy + y_off),
+                            font, scale, color, thick)
+
         return frame
 
     # ── メインループ ──
@@ -345,8 +383,8 @@ class DomainExpansionApp:
 
                 hand_count = len(lm_list)
                 hc = (0,200,80) if hand_count > 0 else (80,80,200)
-                cv2.putText(frame, f"手: {hand_count}本", (10, 32),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, hc, 2)
+                frame = cv2_putText_jp(frame, f"手: {hand_count}本", (10, 32),
+                                       24, hc, 2, anchor="ls")
 
                 # 五条チャージバー
                 if self.gojo_charge_start:
@@ -355,12 +393,12 @@ class DomainExpansionApp:
                     col = (0, int(200*charge), int(255*(1-charge)))
                     cv2.rectangle(frame, (10, h-50), (10+bw, h-38), col, -1)
                     cv2.rectangle(frame, (10, h-50), (w-10, h-38), (80,80,80), 1)
-                    cv2.putText(frame, f"無量空処 CHARGE",
-                                (10, h-55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,180,50), 2)
+                    frame = cv2_putText_jp(frame, f"無量空処 CHARGE",
+                                           (10, h-55), 20, (255,180,50), 2, anchor="ls")
 
                 for i, line in enumerate(status_lines):
-                    cv2.putText(frame, line, (10, h - 10 - 22*i),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160,160,160), 1)
+                    frame = cv2_putText_jp(frame, line, (10, h - 10 - 22*i),
+                                           16, (160,160,160), 1, anchor="ls")
 
                 cv2.imshow("領域展開", frame)
                 key = cv2.waitKey(1) & 0xFF

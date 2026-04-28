@@ -13,8 +13,32 @@ import csv
 import argparse
 import os
 import time
+from PIL import Image, ImageDraw, ImageFont
 
 # ───────────────────────────────────────────────
+# Windowsの標準フォントパス（日本語用）
+FONT_PATH = "C:\\Windows\\Fonts\\msgothic.ttc"
+
+def cv2_putText_jp(img, text, position, font_size, color, thickness=2, anchor="ls"):
+    """
+    OpenCV画像に日本語を表示する。
+    PILを使用して描画し、OpenCV形式に戻す。
+    """
+    if not os.path.exists(FONT_PATH):
+        cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_size/30, color, thickness)
+        return img
+
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    font = ImageFont.truetype(FONT_PATH, int(font_size))
+    
+    # OpenCV (BGR) -> PIL (RGB)
+    rgb_color = (color[2], color[1], color[0])
+    
+    draw.text(position, text, font=font, fill=rgb_color, anchor=anchor)
+    
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
 # モード定義
 TWO_HAND_GESTURES = {
     "sukuna":       "伏魔御厨子（宿儺）",
@@ -196,27 +220,27 @@ def main(gesture: str):
             cv2.rectangle(frame, (0, h - 75), (w, h), (20, 20, 20), -1)
 
             status_color = (0, 220, 100) if collecting else (100, 100, 100)
-            cv2.putText(frame, "● 収集中" if collecting else "○ 停止中",
-                        (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-            cv2.putText(frame, label_name, (150, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 2)
+            frame = cv2_putText_jp(frame, "● 収集中" if collecting else "○ 停止中",
+                                   (10, 35), 26, status_color, 2, anchor="ls")
+            frame = cv2_putText_jp(frame, label_name, (150, 35),
+                                   22, (200, 200, 255), 2, anchor="ls")
 
             # 手の検出状態
             if is_two_hand:
                 hand_count = len(result.multi_hand_landmarks) if result.multi_hand_landmarks else 0
                 ok = hand_count == 2
                 hc = (0, 220, 100) if ok else (0, 100, 220)
-                cv2.putText(frame, f"両手検出: {hand_count}/2",
-                            (10, h - 48), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hc, 2)
+                frame = cv2_putText_jp(frame, f"両手検出: {hand_count}/2",
+                                       (10, h - 48), 22, hc, 2, anchor="ls")
             else:
                 ok = hand_ok
                 hc = (0, 220, 100) if ok else (0, 100, 220)
-                cv2.putText(frame, "右手検出: OK" if ok else "右手検出: NG",
-                            (10, h - 48), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hc, 2)
+                frame = cv2_putText_jp(frame, "右手検出: OK" if ok else "右手検出: NG",
+                                       (10, h - 48), 22, hc, 2, anchor="ls")
 
-            cv2.putText(frame,
-                        f"収集数: {existing + count} / 目標 {existing + SAMPLES_PER_SESSION}",
-                        (10, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2)
+            frame = cv2_putText_jp(frame,
+                                   f"収集数: {existing + count} / 目標 {existing + SAMPLES_PER_SESSION}",
+                                   (10, h - 18), 20, (220, 220, 220), 2, anchor="ls")
 
             progress = min(count / SAMPLES_PER_SESSION, 1.0)
             bar_w = int((w - 20) * progress)
